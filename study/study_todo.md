@@ -2,7 +2,7 @@
 
 ## 目标
 
-从“会使用 vLLM 部署大模型”，成长为“能理解、调优、排障、修改并适配 vLLM 的大模型推理系统工程师”。
+从"会使用 vLLM 部署大模型"，成长为"能理解、调优、排障、修改并适配 vLLM 的大模型推理系统工程师"。
 
 完成这个计划后，应当能做到：
 
@@ -20,49 +20,86 @@
 2. 画状态：把对象、字段、队列、张量 shape 画出来。
 3. 打日志：在关键函数临时打印 `seq_id`、`num_tokens`、`num_cached_tokens`、`num_scheduled_tokens`、`block_table`、`slot_mapping`。
 4. 改参数：用很小的 `max_num_seqs`、`max_num_batched_tokens`、`max_tokens` 制造可观察的调度行为。
-5. 做复盘：每读完一段代码，写下“输入是什么、输出是什么、状态改了什么、可能出错在哪里”。
+5. 做复盘：每读完一段代码，写下"输入是什么、输出是什么、状态改了什么、可能出错在哪里"。
 
 ## 总体路线
 
 | 阶段 | 主题 | 重点文件 | 产出 |
 | --- | --- | --- | --- |
-| 0 | 跑通和入口建立 | `README.md`, `example.py`, `bench.py`, `nanovllm/config.py` | 能跑通 example，整理配置表 |
-| 1 | API 到请求生命周期 | `nanovllm/llm.py`, `nanovllm/engine/llm_engine.py`, `nanovllm/engine/sequence.py`, `nanovllm/sampling_params.py` | Prompt 到 `Sequence` 的调用链图 |
-| 2 | Scheduler 和 batch | `nanovllm/engine/scheduler.py`, `nanovllm/engine/block_manager.py` | `waiting/running/finished` 状态机图 |
-| 3 | KV cache 和 prefix cache | `nanovllm/engine/block_manager.py`, `nanovllm/engine/model_runner.py`, `nanovllm/layers/attention.py` | block table、slot mapping、ref count 图 |
-| 4 | ModelRunner 数据准备 | `nanovllm/engine/model_runner.py`, `nanovllm/utils/context.py` | prefill/decode 张量 shape 对照表 |
-| 5 | 模型 forward 和 attention | `nanovllm/models/qwen3.py`, `nanovllm/layers/attention.py`, `nanovllm/layers/linear.py`, `nanovllm/layers/embed_head.py` | Qwen3 单层 forward 图 |
-| 6 | Sampler 和输出回写 | `nanovllm/layers/sampler.py`, `nanovllm/engine/scheduler.py` | logits 到新 token 的流程图 |
-| 7 | 性能相关能力 | `nanovllm/engine/model_runner.py`, `nanovllm/utils/loader.py`, `nanovllm/layers/linear.py` | Tensor Parallel、CUDA Graph、权重加载笔记 |
-| 8 | 调优、排障和改造 | `bench.py` 及上述核心模块 | 一个可验证的小改造 |
+| 0 | 跑通和入口建立 | `README.md`, `example.py`, `nanovllm/llm.py`, `nanovllm/engine/llm_engine.py`, `nanovllm/config.py` | 能跑通 example，画出初始化链路 |
+| 1 | API 到请求生命周期 | `nanovllm/llm.py`, `nanovllm/engine/llm_engine.py`, `nanovllm/engine/sequence.py`, `nanovllm/sampling_params.py` | Prompt 到 Sequence 的调用链图，完成一次全链路 trace |
+| 2 | Scheduler、KV cache 和 block 管理 | `nanovllm/engine/scheduler.py`, `nanovllm/engine/block_manager.py` | 状态机图 + block 映射图 |
+| 3 | ModelRunner 数据准备 | `nanovllm/engine/model_runner.py`, `nanovllm/utils/context.py` | prefill/decode 张量 shape 对照表 |
+| 4 | 模型 forward 和 attention | `nanovllm/models/qwen3.py`, `nanovllm/layers/attention.py`, `nanovllm/layers/linear.py`, `nanovllm/layers/embed_head.py` | Qwen3 单层 forward 图 |
+| 5 | Sampler 和输出回写 | `nanovllm/layers/sampler.py`, `nanovllm/engine/scheduler.py` | logits 到新 token 的流程图 |
+| 6 | 性能相关能力 | `nanovllm/engine/model_runner.py`, `nanovllm/utils/loader.py`, `nanovllm/layers/linear.py` | TP、CUDA Graph、权重加载笔记 |
+| 7 | 调优、排障和改造 | `bench.py` 及上述核心模块 | 一个可验证的小改造 |
 
 ## 阶段 0：跑通和入口建立
 
-目标：不要先陷入 attention 细节，先确认整个系统能运行，并知道入口在哪里。
+目标：确认整个系统能运行，建立初始化地图。不要在这里卡太久，细节留到后续阶段。
 
 阅读顺序：
 
 1. `README.md`
 2. `example.py`
-3. `bench.py`
-4. `nanovllm/config.py`
+3. `nanovllm/llm.py`
+4. `nanovllm/engine/llm_engine.py`
+5. `nanovllm/config.py`
+
+初始化主链路：
+
+```text
+LLM(path, **kwargs)
+  -> LLMEngine.__init__(model, **kwargs)
+  -> 从 kwargs 中筛出 Config 支持的字段
+  -> Config(model, **config_kwargs)
+      -> 检查模型目录
+      -> 读取 Hugging Face config
+      -> 修正 max_model_len
+  -> Sequence.block_size = config.kvcache_block_size
+  -> 根据 tensor_parallel_size 启动 worker ModelRunner 进程
+  -> 创建 rank 0 的 ModelRunner
+      -> 初始化 torch distributed
+      -> 加载 Qwen3 模型结构
+      -> load_model() 加载权重
+      -> warmup_model()
+      -> allocate_kv_cache()
+      -> 可选 capture_cudagraph()
+  -> AutoTokenizer.from_pretrained(config.model)
+  -> config.eos = tokenizer.eos_token_id
+  -> Scheduler(config)
+  -> atexit.register(self.exit)
+```
+
+初始化时重点观察：
+
+| 对象/步骤 | 作用 | 先不用深挖的部分 |
+| --- | --- | --- |
+| `Config` | 收集并校验运行参数，读取模型 config | 模型具体结构 |
+| `Sequence.block_size` | 让所有 sequence 使用统一 KV block 大小 | block 分配策略 |
+| worker `ModelRunner` | tensor parallel 大于 1 时启动其他 rank | shared memory 调用细节 |
+| rank 0 `ModelRunner` | 当前进程里的主模型执行器 | forward 和 attention 细节 |
+| `AutoTokenizer` | 后续把文本 prompt 编码成 token | chat template 细节 |
+| `Scheduler` | 创建等待队列、运行队列和 block manager | 调度策略细节 |
 
 任务：
 
 - [ ] 跑通 `python example.py --model_path <local-model-dir>`。
 - [ ] 记录当前机器、模型、显存、`tensor_parallel_size`、`enforce_eager`。
-- [ ] 整理 `Config` 字段：`max_num_batched_tokens`、`max_num_seqs`、`max_model_len`、`gpu_memory_utilization`、`kvcache_block_size` 分别影响什么。
-- [ ] 对比 `example.py` 和 `bench.py`：前者验证 API，后者验证吞吐和长短请求混合。
+- [ ] 画出 `LLM(path, enforce_eager=True, tensor_parallel_size=1)` 的初始化调用链。
+- [ ] 标出初始化阶段哪些步骤会访问磁盘、哪些步骤会占用 GPU 显存、哪些步骤会启动额外进程。
 
 思考问题：
 
 1. 为什么 `Config.__post_init__()` 要读取 Hugging Face config？
 2. `max_model_len` 为什么要和 `hf_config.max_position_embeddings` 取最小值？
-3. `bench.py` 为什么直接传 token id，而不是传字符串 prompt？
+3. `LLMEngine.__init__()` 为什么要从 `kwargs` 中筛出 `Config` 支持的字段？
+4. `enforce_eager=True` 会跳过哪类性能优化？为什么 example 里更适合打开它？
 
 ## 阶段 1：API 到请求生命周期
 
-目标：理解 prompt 如何进入系统，以及 `Sequence` 如何保存请求状态。
+目标：理解 prompt 如何进入系统，`Sequence` 如何保存请求状态，并通过一次全链路 trace 建立直觉。
 
 阅读顺序：
 
@@ -100,6 +137,24 @@ LLM.generate()
 - [ ] 解释为什么 `completion_token_ids` 可以通过 `token_ids[num_prompt_tokens:]` 得到。
 - [ ] 解释 `Sequence.__getstate__()` 和 `__setstate__()` 为什么在 prefill 和 decode 阶段保存不同内容。
 
+全链路 trace 实验（本阶段最重要的实验）：
+
+用极简配置跑一个短 prompt，在 `LLMEngine.step()` 里加一行 print，观察完整的 prefill → decode → finish 循环：
+
+```python
+# 配置
+max_num_seqs=1, max_num_batched_tokens=32, enforce_eager=True
+
+# 在 LLMEngine.step() 开头加：
+print(f"step: waiting={len(scheduler.waiting)} running={len(scheduler.running)}")
+```
+
+观察目标：
+- 第一轮 step 是 prefill 还是 decode？
+- prefill 完成后 sequence 去了哪个队列？
+- 每轮 decode 产出几个 token？
+- 什么条件下循环结束？
+
 思考问题：
 
 1. 一个 prompt 输入后，内部会被包装成什么对象？
@@ -107,15 +162,17 @@ LLM.generate()
 3. `generate()` 为什么需要用 `seq_id` 重新排序输出？
 4. `SamplingParams` 为什么禁止 `temperature <= 1e-10`？
 
-## 阶段 2：Scheduler 和 batch
+## 阶段 2：Scheduler、KV cache 和 block 管理
 
-目标：理解每一轮 step 到底调度什么，以及 prefill/decode 如何切换。
+目标：理解调度策略和 KV cache 的分配/复用/释放。这两部分耦合紧密（scheduler 直接调用 block_manager），一起学习效率更高。笔记可以分"调度逻辑"和"block 管理"两个主题记录。
 
 阅读顺序：
 
 1. `nanovllm/engine/scheduler.py`
 2. `nanovllm/engine/block_manager.py`
 3. 回看 `LLMEngine.step()`
+
+### 调度逻辑
 
 核心事实：
 
@@ -134,35 +191,9 @@ Prefill 和 decode 对照：
 | `is_prefill` | `True` | `False` |
 | 是否可能 chunk | 是，当前实现只允许第一个 seq 被 chunk | 否 |
 | 是否写 KV cache | 是 | 是 |
-| 是否使用已有 KV cache | prefix cache 命中时使用 | 总是依赖历史 KV |
 | batch 是否混合阶段 | 不混合 | 不混合 |
 
-任务：
-
-- [ ] 用 `max_num_seqs=2`、较小的 `max_num_batched_tokens` 运行，观察多个 prompt 如何进入 `waiting` 和 `running`。
-- [ ] 制造长 prompt，观察 chunked prefill：`num_scheduled_tokens < num_tokens - num_cached_tokens`。
-- [ ] 制造很多请求或降低可用 block，理解 `preempt()` 的触发条件。
-- [ ] 画出 `WAITING -> RUNNING -> FINISHED` 和 `RUNNING -> WAITING` 的状态机。
-
-思考问题：
-
-1. Scheduler 每一轮到底在调度 sequence 还是 token？
-2. 为什么 prefill 通常比 decode 更适合批量并行？
-3. 为什么当前实现只允许第一个 sequence 做 chunked prefill？
-4. 一个 batch 里面可以同时包含 prefill 和 decode 请求吗？当前答案是什么？如果想支持混合 batch，需要改哪些地方？
-
-## 阶段 3：KV cache 和 prefix cache
-
-目标：把逻辑 token、逻辑 block、物理 KV block、attention slot 对起来。
-
-阅读顺序：
-
-1. `nanovllm/engine/block_manager.py`
-2. `ModelRunner.allocate_kv_cache()`
-3. `ModelRunner.prepare_block_tables()`
-4. `ModelRunner.prepare_prefill()`
-5. `ModelRunner.prepare_decode()`
-6. `nanovllm/layers/attention.py`
+### KV cache 和 block 管理
 
 关键对象：
 
@@ -201,25 +232,31 @@ Scheduler.postprocess()
   -> 完成时 BlockManager.deallocate()
 ```
 
-任务：
+### 任务
 
+- [ ] 用 `max_num_seqs=2`、较小的 `max_num_batched_tokens` 运行，观察多个 prompt 如何进入 `waiting` 和 `running`。
+- [ ] 制造长 prompt，观察 chunked prefill：`num_scheduled_tokens < num_tokens - num_cached_tokens`。
+- [ ] 制造很多请求或降低可用 block，理解 `preempt()` 的触发条件。
+- [ ] 画出 `WAITING -> RUNNING -> FINISHED` 和 `RUNNING -> WAITING` 的状态机。
 - [ ] 手工构造两个有相同长前缀的 prompt，观察 `num_cached_tokens`、`block_table` 和 `ref_count`。
 - [ ] 解释为什么 `can_allocate()` 只检查到 `seq.num_blocks - 1`，即不缓存最后一个未满 block。
 - [ ] 解释 `hash_blocks()` 什么时候给 block 写入 hash。
-- [ ] 解释 `can_append()` 中 `len(seq) % block_size == 1` 的意义：decode 时当前 `last_token` 可能刚好落在一个新 block 的第一个 slot。
 - [ ] 画出一个 prompt 长度超过 `kvcache_block_size` 时的 block table。
 
-思考问题：
+### 思考问题
 
-1. KV cache 是什么时候真正分配显存的？
-2. 某个 sequence 的 KV block 是什么时候分配的？
-3. prefix cache 命中后，为什么仍然需要调度未缓存的 token？
-4. request 结束后，KV cache 是在哪里释放的？
-5. preemption 为什么要 `deallocate()`，又为什么能通过 prefix cache 降低重复计算成本？
+1. Scheduler 每一轮到底在调度 sequence 还是 token？
+2. 为什么 prefill 通常比 decode 更适合批量并行？
+3. 为什么当前实现只允许第一个 sequence 做 chunked prefill？
+4. 一个 batch 里面可以同时包含 prefill 和 decode 请求吗？当前答案是什么？
+5. KV cache 是什么时候真正分配显存的？某个 sequence 的 KV block 是什么时候分配的？
+6. prefix cache 命中后，为什么仍然需要调度未缓存的 token？
+7. request 结束后，KV cache 是在哪里释放的？
+8. preemption 为什么要 `deallocate()`，又为什么能通过 prefix cache 降低重复计算成本？
 
-## 阶段 4：ModelRunner 数据准备
+## 阶段 3：ModelRunner 数据准备
 
-目标：理解 scheduler 选出来的是 Python 对象，模型真正吃的是张量。
+目标：理解 scheduler 选出来的是 Python 对象，模型真正吃的是张量。本阶段紧接阶段 2，趁对 block_table 和 slot_mapping 的理解还热，看它们如何变成 GPU 张量。
 
 阅读顺序：
 
@@ -257,7 +294,7 @@ Prefill/decode 张量对照：
 3. prefix cache 命中时，`cu_seqlens_k[-1]` 为什么可能大于 `cu_seqlens_q[-1]`？
 4. `slot_mapping` 和 `block_tables` 分别解决什么问题？
 
-## 阶段 5：模型 forward 和 attention
+## 阶段 4：模型 forward 和 attention
 
 目标：理解 Qwen3 模型结构如何接入推理运行时，而不是只把它当黑盒。
 
@@ -303,7 +340,7 @@ input_ids
 3. tensor parallel 下 logits 为什么需要 gather？
 4. 如果输出明显异常，应该检查 tokenizer、positions、RoPE、权重加载还是 sampler？分别怎么看？
 
-## 阶段 6：Sampler 和输出回写
+## 阶段 5：Sampler 和输出回写
 
 目标：理解模型 forward 后如何得到下一个 token，以及新 token 如何回到 sequence 状态。
 
@@ -344,7 +381,7 @@ logits
 3. `ignore_eos=True` 对 benchmark 有什么影响？
 4. 如果输出比预期短或停不下来，应该检查哪些字段？
 
-## 阶段 7：性能相关能力
+## 阶段 6：性能相关能力
 
 目标：理解 nano-vllm 中和推理性能直接相关的实现。
 
@@ -363,6 +400,7 @@ logits
 - [ ] 解释为什么 prefill 不走 CUDA Graph，而 decode 在条件满足时可以走。
 - [ ] 解释 tensor parallel worker 进程如何通过 shared memory 收到 rank 0 的调用。
 - [ ] 解释 packed q/k/v、gate/up 权重如何被加载到合并后的参数中。
+- [ ] 对比 `example.py` 和 `bench.py`：前者验证 API，后者验证吞吐和长短请求混合。
 
 思考问题：
 
@@ -371,20 +409,23 @@ logits
 3. CUDA Graph 为什么要求较稳定的 shape？
 4. Tensor Parallel 下哪些层需要 all-reduce，哪些层需要 gather？
 
-## 阶段 8：调优、排障和改造练习
+## 阶段 7：调优、排障和改造练习
 
-目标：从“读懂”进入“能改、能测、能解释现象”。
+目标：从"读懂"进入"能改、能测、能解释现象"。
 
-建议练习从简单到困难：
+### 建议练习（由易到难）
 
 1. 增加 scheduler debug 日志，输出每轮是 prefill 还是 decode、调度了哪些 seq、每个 seq 的 token/block 状态。
 2. 给 `Sequence` 和 `BlockManager` 写不依赖 GPU 的单元测试，覆盖 allocate、deallocate、prefix cache 命中、ref count。
 3. 增加一种采样能力：greedy、top-k、top-p 或 stop token ids。
 4. 增加一个小 benchmark case：短 prompt 长输出、长 prompt 短输出、共享前缀 prompt、随机 prompt 四组对比。
-5. 尝试支持混合 prefill/decode batch，先写设计文档，再改 scheduler、context 和 attention 输入准备。
+
+### Stretch goals（选做）
+
+5. 尝试支持混合 prefill/decode batch。这是 vLLM 社区花了大量精力做的事，建议先写设计文档分析需要改哪些地方（scheduler、context、attention 输入准备），再决定是否实现。
 6. 尝试适配一个和 Qwen3 结构相近的模型，重点看 config 字段、权重名映射、attention head 配置和 tokenizer。
 
-排障清单：
+### 排障清单
 
 | 现象 | 优先检查 |
 | --- | --- |
@@ -395,6 +436,25 @@ logits
 | 请求提前结束 | `eos`, `ignore_eos`, `max_tokens` |
 | 请求无法结束 | `ignore_eos`, `max_tokens`, EOS token id 是否正确 |
 | tensor parallel 卡住 | NCCL、rank 数、CUDA device、worker 进程、端口占用 |
+
+## 附录：对照 vLLM 源码
+
+学完 nano-vllm 后，花半天时间对照 vLLM 的对应模块，理解生产系统为什么要加那些复杂度。
+
+| nano-vllm 概念 | vLLM 对应 | 主要差异 |
+| --- | --- | --- |
+| `Sequence` | `SequenceGroup` + `Sequence` | vLLM 支持 beam search，一个 request 可以有多个 sequence |
+| `BlockManager` | `BlockSpaceManagerV2` | vLLM 支持 swap（GPU↔CPU）、CoW（copy-on-write） |
+| `Scheduler.schedule()` | `Scheduler.schedule()` → `SchedulerOutput` | vLLM 有更复杂的优先级、budget 控制、chunked prefill 策略 |
+| `ModelRunner.run()` | `ModelRunner.execute_model()` | vLLM 支持 speculative decoding、多模态输入 |
+| 不混合 prefill/decode | 可混合（chunked prefill） | vLLM 通过 padding 和分段 attention mask 实现混合 batch |
+| 单模型 Qwen3 | 模型注册表 | vLLM 通过 registry 支持数百种模型 |
+
+建议对照阅读的 vLLM 文件：
+- `vllm/sequence.py` — SequenceGroup 的设计
+- `vllm/core/block_manager.py` — swap 和 CoW 逻辑
+- `vllm/core/scheduler.py` — budget-based scheduling
+- `vllm/worker/model_runner.py` — 混合 batch 的张量准备
 
 ## 必须画出的图
 
